@@ -28,7 +28,7 @@ export async function plugin (cli, client) {
     .alias('set')
     .action(async (key, value, opts) => {
       const space = mustGetSpace(client)
-      const [blocks, head] = await Promise.all([getBlockFetcher(space.did()), readLocalClockHead(space.did())])
+      const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
       const res = await Pail.put(blocks, head, key, CID.parse(value))
 
       await blocks.cache.put(res.event.cid, res.event.bytes)
@@ -36,19 +36,19 @@ export async function plugin (cli, client) {
         await blocks.cache.put(block.cid, block.bytes)
       }
 
-      const pendingBlocks = await readPendingBlocks(space.did())
+      const pendingBlocks = await readPendingBlocks(client.agent().did(), space.did())
       pendingBlocks.push(res.event.cid, ...res.additions.map(a => a.cid))
 
-      await writePendingBlocks(space.did(), pendingBlocks)
-      await writeLocalClockHead(space.did(), res.head)
+      await writePendingBlocks(client.agent().did(), space.did(), pendingBlocks)
+      await writeLocalClockHead(client.agent().did(), space.did(), res.head)
     })
 
   cli.command('bucket get <key>')
     .describe('Get the stored value for the given key from the bucket. If the key is not found, `undefined` is returned.')
     .action(async (key, opts) => {
       const space = mustGetSpace(client)
-      const blocks = await getBlockFetcher(space.did())
-      const head = await readLocalClockHead(space.did())
+      const blocks = await getBlockFetcher(client.agent().did(), space.did())
+      const head = await readLocalClockHead(client.agent().did(), space.did())
       const value = await Pail.get(blocks, head, key)
       if (value) console.log(value.toString())
     })
@@ -58,7 +58,7 @@ export async function plugin (cli, client) {
     .alias('delete', 'rm', 'remove')
     .action(async (key, opts) => {
       const space = mustGetSpace(client)
-      const [blocks, head] = await Promise.all([getBlockFetcher(space.did()), readLocalClockHead(space.did())])
+      const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
       const res = await Pail.del(blocks, head, key)
 
       await blocks.cache.put(res.event.cid, res.event.bytes)
@@ -66,11 +66,11 @@ export async function plugin (cli, client) {
         await blocks.cache.put(block.cid, block.bytes)
       }
 
-      const pendingBlocks = await readPendingBlocks(space.did())
+      const pendingBlocks = await readPendingBlocks(client.agent().did(), space.did())
       pendingBlocks.push(res.event.cid, ...res.additions.map(a => a.cid))
 
-      await writePendingBlocks(space.did(), pendingBlocks)
-      await writeLocalClockHead(space.did(), res.head)
+      await writePendingBlocks(client.agent().did(), space.did(), pendingBlocks)
+      await writeLocalClockHead(client.agent().did(), space.did(), res.head)
     })
 
   cli.command('bucket ls')
@@ -80,7 +80,7 @@ export async function plugin (cli, client) {
     .option('--json', 'Format output as newline delimted JSON.')
     .action(async (opts) => {
       const space = mustGetSpace(client)
-      const [blocks, head] = await Promise.all([getBlockFetcher(space.did()), readLocalClockHead(space.did())])
+      const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
       let n = 0
       if (head.length) {
         for await (const [k, v] of Pail.entries(blocks, head, { prefix: opts.prefix })) {
@@ -95,16 +95,16 @@ export async function plugin (cli, client) {
     .describe('Visualise the bucket.')
     .action(async (opts) => {
       const space = mustGetSpace(client)
-      const blocks = await getBlockFetcher(space.did())
+      const blocks = await getBlockFetcher(client.agent().did(), space.did())
 
-      const localHead = await readLocalClockHead(space.did())
+      const localHead = await readLocalClockHead(client.agent().did(), space.did())
       if (!localHead.length) return
 
-      const root = await Pail.root(blocks, localHead)
-      if (!root) throw new Error('no root') // should not happen
+      const rootRes = await Pail.root(blocks, localHead)
+      rootRes.additions.forEach(a => blocks.cache.put(a.cid, a.bytes))
 
       const shards = new ShardFetcher(blocks)
-      const rshard = await shards.get(root)
+      const rshard = await shards.get(rootRes.root)
   
       /** @type {archy.Data} */
       const archyRoot = { label: `Shard(${clc.yellow(rshard.cid.toString())}) ${rshard.bytes.length + 'b'}`, nodes: [] }
@@ -140,20 +140,20 @@ export async function plugin (cli, client) {
       if (!proofs.length) {
         throw new Error(`${client.agent().did()} does not have write access to ${space.did()}`)
       }
-      const config = await readConfig(space.did())
+      const config = await readConfig(client.agent().did(), space.did())
       if (!config.remotes[remote]) {
         throw new Error(`remote "${remote}" is not known`)
       }
-      const localHead = await readLocalClockHead(space.did())
+      const localHead = await readLocalClockHead(client.agent().did(), space.did())
       if (!localHead.length) {
         return console.log('Done, nothing to push.')
       }
-      const pendingCIDs = await readPendingBlocks(space.did())
+      const pendingCIDs = await readPendingBlocks(client.agent().did(), space.did())
       if (!pendingCIDs.length) {
         return console.log('Done, nothing to push.')
       }
       
-      const blocks = await getBlockFetcher(space.did())
+      const blocks = await getBlockFetcher(client.agent().did(), space.did())
       const pendingBlocks = []
       for await (const cid of pendingCIDs) {
         // @ts-ignore
@@ -161,13 +161,13 @@ export async function plugin (cli, client) {
         pendingBlocks.push({ cid, bytes })
       }
 
-      const root = await Pail.root(blocks, localHead)
-      if (!root) throw new Error('no root') // should not happen
+      const rootRes = await Pail.root(blocks, localHead)
+      pendingBlocks.push(...rootRes.additions)
 
       console.log(`Storing ${pendingBlocks.length} blocks:`)
       pendingCIDs.forEach(cid => console.log(`\t${cid}`))
       // @ts-ignore
-      await storeBlocks(client, root, pendingBlocks)
+      await storeBlocks(client, rootRes.root, pendingBlocks)
 
       const connection = Remote.connect({
         servicePrincipal: { did: () => config.remotes[remote].id },
@@ -183,7 +183,7 @@ export async function plugin (cli, client) {
         n++
       }
 
-      await writePendingBlocks(space.did(), [])
+      await writePendingBlocks(client.agent().did(), space.did(), [])
       console.log(`Done, ${remote} head updated:`)
       remoteHead?.forEach(e => console.log(`\t${e}`))
     })
@@ -196,7 +196,7 @@ export async function plugin (cli, client) {
       if (!proofs.length) {
         throw new Error(`${client.agent().did()} does not have write access to ${space.did()}`)
       }
-      const config = await readConfig(space.did())
+      const config = await readConfig(client.agent().did(), space.did())
       if (!config.remotes[remote]) {
         throw new Error(`remote "${remote}" is not known`)
       }
@@ -207,8 +207,8 @@ export async function plugin (cli, client) {
       })
       const remoteHead = await Remote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
 
-      const blocks = await getBlockFetcher(space.did())
-      let localHead = await readLocalClockHead(space.did())
+      const blocks = await getBlockFetcher(client.agent().did(), space.did())
+      let localHead = await readLocalClockHead(client.agent().did(), space.did())
       let n = 1
       console.log(`Pulling events from ${remote}:`)
       for await (const event of remoteHead) {
@@ -219,7 +219,7 @@ export async function plugin (cli, client) {
       if (!localHead.length) {
         return console.log('Done, nothing to pull.')
       }
-      await writeLocalClockHead(space.did(), localHead)
+      await writeLocalClockHead(client.agent().did(), space.did(), localHead)
       console.log(`Done, local head updated:`)
       localHead.forEach(e => console.log(`\t${e}`))
     })
@@ -228,18 +228,18 @@ export async function plugin (cli, client) {
     .describe('Add a remote to config.')
     .action(async (name, did, url) => {
       const space = mustGetSpace(client)
-      const config = await readConfig(space.did())
+      const config = await readConfig(client.agent().did(), space.did())
       config.remotes[name] = { id: did, url }
-      await writeConfig(space.did(), config)
+      await writeConfig(client.agent().did(), space.did(), config)
     })
 
   cli.command('bucket remote remove <name>')
     .describe('Remove a remote from config.')
     .action(async (name) => {
       const space = mustGetSpace(client)
-      const config = await readConfig(space.did())
+      const config = await readConfig(client.agent().did(), space.did())
       delete config.remotes[name]
-      await writeConfig(space.did(), config)
+      await writeConfig(client.agent().did(), space.did(), config)
     })
 
   cli.command('bucket remote ls')
@@ -247,7 +247,7 @@ export async function plugin (cli, client) {
     .option('--verbose', 'Show additional remote information.', false)
     .action(async (opts) => {
       const space = mustGetSpace(client)
-      const config = await readConfig(space.did())
+      const config = await readConfig(client.agent().did(), space.did())
       for (const [name, { id, url }] of Object.entries(config.remotes)) {
         if (opts.verbose) {
           console.log(`${name}\t${id}\t${url}`)
@@ -269,7 +269,7 @@ export async function plugin (cli, client) {
         if (!proofs.length) {
           throw new Error(`${client.agent().did()} does not have write access to ${space.did()}`)
         }
-        const config = await readConfig(space.did())
+        const config = await readConfig(client.agent().did(), space.did())
         if (!config.remotes[remote]) {
           throw new Error(`remote "${remote}" is not known`)
         }
@@ -279,7 +279,7 @@ export async function plugin (cli, client) {
         })
         head = await Remote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
       } else {
-        head = await readLocalClockHead(space.did())
+        head = await readLocalClockHead(client.agent().did(), space.did())
       }
       head.forEach(h => console.log(h.toString()))
     })
@@ -319,16 +319,20 @@ function defaultConfig () {
   }
 }
 
-function bucketPath () {
-  return process.env.W3BUCKET_PATH ?? path.join(os.homedir(), '.w3bucket')
+/**
+ * @param {import('@ucanto/interface').DID} agentDID
+ */
+function bucketPath (agentDID) {
+  return process.env.W3BUCKET_PATH ?? path.join(os.homedir(), '.w3bucket', agentDID)
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  * @returns {Promise<Config>}
  */
-async function readConfig (id) {
-  const file = path.join(bucketPath(), id, 'config.json')
+async function readConfig (agentDID, spaceDID) {
+  const file = path.join(bucketPath(agentDID), spaceDID, 'config.json')
   try {
     return json.decode(await fs.promises.readFile(file))
   } catch (err) {
@@ -338,21 +342,23 @@ async function readConfig (id) {
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  * @param {Config} config
  */
-async function writeConfig (id, config) {
-  const dir = path.join(bucketPath(), id)
+async function writeConfig (agentDID, spaceDID, config) {
+  const dir = path.join(bucketPath(agentDID), spaceDID)
   await fs.promises.mkdir(dir, { recursive: true })
   await fs.promises.writeFile(path.join(dir, 'config.json'), json.encode(config))
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  * @returns {Promise<import('@alanshaw/pail/clock').EventLink<import('@alanshaw/pail/crdt').EventData>[]>}
  */
-async function readLocalClockHead (id) {
-  const file = path.join(bucketPath(), id, 'HEAD.json')
+async function readLocalClockHead (agentDID, spaceDID) {
+  const file = path.join(bucketPath(agentDID), spaceDID, 'HEAD.json')
   try {
     return json.decode(await fs.promises.readFile(file))
   } catch (err) {
@@ -362,21 +368,23 @@ async function readLocalClockHead (id) {
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  * @param {import('@alanshaw/pail/clock').EventLink<import('@alanshaw/pail/crdt').EventData>[]} head
  */
-async function writeLocalClockHead (id, head) {
-  const dir = path.join(bucketPath(), id)
+async function writeLocalClockHead (agentDID, spaceDID, head) {
+  const dir = path.join(bucketPath(agentDID), spaceDID)
   await fs.promises.mkdir(dir, { recursive: true })
   await fs.promises.writeFile(path.join(dir, 'HEAD.json'), json.encode(head))
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  * @returns {Promise<import('multiformats').Link[]>}
  */
-async function readPendingBlocks (id) {
-  const file = path.join(bucketPath(), id, 'pending.json')
+async function readPendingBlocks (agentDID, spaceDID) {
+  const file = path.join(bucketPath(agentDID), spaceDID, 'pending.json')
   try {
     return json.decode(await fs.promises.readFile(file))
   } catch (err) {
@@ -386,20 +394,22 @@ async function readPendingBlocks (id) {
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  * @param {import('multiformats').Link[]} blocks
  */
-async function writePendingBlocks (id, blocks) {
-  const dir = path.join(bucketPath(), id)
+async function writePendingBlocks (agentDID, spaceDID, blocks) {
+  const dir = path.join(bucketPath(agentDID), spaceDID)
   await fs.promises.mkdir(dir, { recursive: true })
   await fs.promises.writeFile(path.join(dir, 'pending.json'), json.encode(blocks))
 }
 
 /**
- * @param {import('@ucanto/interface').DID} id
+ * @param {import('@ucanto/interface').DID} agentDID
+ * @param {import('@ucanto/interface').DID} spaceDID
  */
-async function getBlockFetcher (id) {
-  const dir = path.join(bucketPath(), id, 'blocks')
+async function getBlockFetcher (agentDID, spaceDID) {
+  const dir = path.join(bucketPath(agentDID), spaceDID, 'blocks')
   const cache = new FsBlockstore(dir)
   await cache.open()
 
