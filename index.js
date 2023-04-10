@@ -4,6 +4,7 @@ import os from 'os'
 import path from 'path'
 import clc from 'cli-color'
 import archy from 'archy'
+import http from 'http'
 import { CID } from 'multiformats/cid'
 import { CarBufferWriter } from '@ipld/car'
 import * as Pail from '@alanshaw/pail/crdt'
@@ -11,7 +12,10 @@ import * as Clock from '@alanshaw/pail/clock'
 import { ShardFetcher } from '@alanshaw/pail/shard'
 import * as json from '@ipld/dag-json'
 import * as Remote from '@web3-storage/clock/client'
+import * as Server from '@web3-storage/clock/server'
+import * as ClockCaps from '@web3-storage/clock/capabilities'
 import { FsBlockstore, GatewayBlockFetcher } from './block.js'
+import { Failure } from '@ucanto/server'
 
 /**
  * @typedef {{ id: import('@ucanto/interface').DID, url: string }} Remote
@@ -284,18 +288,76 @@ export async function plugin (cli, client) {
       head.forEach(h => console.log(h.toString()))
     })
 
-  // cli.command('bucket server')
-  //   .describe('Start a bucket HTTP server so participants can push updates directly to you.')
+  cli.command('bucket server')
+    .describe('Start a bucket HTTP server so participants can push updates directly to you.')
+    .option('-p, --port', 'Port to start the server on', 9417)
+    .action(async (opts) => {
+      const space = mustGetSpace(client)
+      const server = Server.createServer(client.agent(), {
+        clock: {
+          advance: Server.provide(
+            ClockCaps.advance,
+            async ({ capability }) => {
+              if (capability.with !== space.did()) {
+                return new Failure(`invalid resource: ${capability.with}`)
+              }
+              const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
+              const res = await Clock.advance(blocks, head, capability.nb.event)
+              await writeLocalClockHead(client.agent().did(), space.did(), res)
+              return res
+            }
+          ),
+          head: Server.provide(
+            ClockCaps.head,
+            async ({ capability }) => {
+              if (capability.with !== space.did()) {
+                return new Failure(`invalid resource: ${capability.with}`)
+              }
+              return await readLocalClockHead(client.agent().did(), space.did())
+            }
+          )
+        }
+      })
+
+      const httpServer = http.createServer(async (request, response) => {
+        try {
+          const chunks = []
+          for await (const chunk of request) {
+            chunks.push(chunk)
+          }
+
+          const { headers, body } = await server.request({
+            body: Buffer.from(chunks),
+            // @ts-ignore
+            headers: request.headers
+          })
+
+          response.writeHead(200, headers)
+          response.write(body)
+        } catch (err) {
+          console.error(err)
+          response.writeHead(500)
+        } finally {
+          response.end()
+        }
+      })
+      const port = opts.port ?? 9417
+
+      httpServer.listen(port, () => console.log(`Listening on :${port}`))
+    })
 }
 
 /**
  * @param {import('@web3-storage/w3up-client').Client} client
  * @param {import('@alanshaw/pail/shard').ShardLink} root
- * @param {import('multiformats').Block[]} blocks
+ * @param {import('@alanshaw/pail/block').AnyBlock[]} blocks
  */
 async function storeBlocks (client, root, blocks) {
   const headerLength = CarBufferWriter.estimateHeaderLength(1)
-  const byteLength = blocks.reduce((l, b) => l + CarBufferWriter.blockLength(b), 0)
+  const byteLength = blocks.reduce((l, b) => {
+    // @ts-ignore
+    return l + CarBufferWriter.blockLength(b)
+  }, 0)
   const buffer = new ArrayBuffer(headerLength + byteLength)
   // @ts-ignore
   const writer = CarBufferWriter.createWriter(buffer, { roots: [root] })
