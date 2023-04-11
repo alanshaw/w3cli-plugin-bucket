@@ -11,11 +11,14 @@ import * as Pail from '@alanshaw/pail/crdt'
 import * as Clock from '@alanshaw/pail/clock'
 import { ShardFetcher } from '@alanshaw/pail/shard'
 import * as json from '@ipld/dag-json'
-import * as Remote from '@web3-storage/clock/client'
-import * as Server from '@web3-storage/clock/server'
+import * as ClockRemote from '@web3-storage/clock/client'
+import * as ClockServer from '@web3-storage/clock/server'
 import * as ClockCaps from '@web3-storage/clock/capabilities'
+import * as BlockCaps from './blocksvc/capabilities.js'
+import { Fetcher as BlockServiceBlockFetcher } from './blocksvc/fetcher.js'
 import { FsBlockstore, GatewayBlockFetcher } from './block.js'
 import { Failure } from '@ucanto/server'
+import { MultiBlockFetcher } from '@alanshaw/pail/block'
 
 /**
  * @typedef {{ id: import('@ucanto/interface').DID, url: string }} Remote
@@ -29,7 +32,7 @@ import { Failure } from '@ucanto/server'
 export async function plugin (cli, client) {
   cli.command('bucket put <key> <value>')
     .describe('Put a value (a CID) for the given key. If the key exists it\'s value is overwritten.')
-    .alias('set')
+    .alias('bucket set')
     .action(async (key, value, opts) => {
       const space = mustGetSpace(client)
       const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
@@ -59,7 +62,7 @@ export async function plugin (cli, client) {
 
   cli.command('bucket del <key>')
     .describe('Delete the value for the given key from the bucket. If the key is not found no operation occurs.')
-    .alias('delete', 'rm', 'remove')
+    .alias('bucket delete', 'bucket rm', 'bucket remove')
     .action(async (key, opts) => {
       const space = mustGetSpace(client)
       const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
@@ -79,7 +82,7 @@ export async function plugin (cli, client) {
 
   cli.command('bucket ls')
     .describe('List entries in the bucket.')
-    .alias('list')
+    .alias('bucket list')
     .option('-p, --prefix', 'Key prefix to filter by.')
     .option('--json', 'Format output as newline delimted JSON.')
     .action(async (opts) => {
@@ -173,7 +176,7 @@ export async function plugin (cli, client) {
       // @ts-ignore
       await storeBlocks(client, rootRes.root, pendingBlocks)
 
-      const connection = Remote.connect({
+      const connection = ClockRemote.connect({
         servicePrincipal: { did: () => config.remotes[remote].id },
         serviceURL: new URL(config.remotes[remote].url)
       })
@@ -183,7 +186,7 @@ export async function plugin (cli, client) {
       console.log(`Pushing events to ${remote}:`)
       for await (const event of localHead) {
         console.log(`\t${event} (${n} of ${localHead.length})`)
-        remoteHead = await Remote.advance({ issuer: client.agent(), with: space.did(), proofs }, event, { connection })
+        remoteHead = await ClockRemote.advance({ issuer: client.agent(), with: space.did(), proofs }, event, { connection })
         n++
       }
 
@@ -205,13 +208,18 @@ export async function plugin (cli, client) {
         throw new Error(`remote "${remote}" is not known`)
       }
 
-      const connection = Remote.connect({
+      const connection = ClockRemote.connect({
         servicePrincipal: { did: () => config.remotes[remote].id },
         serviceURL: new URL(config.remotes[remote].url)
       })
-      const remoteHead = await Remote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
+      const remoteHead = await ClockRemote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
 
-      const blocks = await getBlockFetcher(client.agent().did(), space.did())
+      /** @type {import('@alanshaw/pail/block').BlockFetcher} */
+      let blocks = await getBlockFetcher(client.agent().did(), space.did())
+      // @ts-ignore
+      const bsBlocks = getBlockServiceBlockFetcher(client, connection)
+      blocks = bsBlocks ? new MultiBlockFetcher(bsBlocks, blocks) : blocks
+
       let localHead = await readLocalClockHead(client.agent().did(), space.did())
       let n = 1
       console.log(`Pulling events from ${remote}:`)
@@ -228,7 +236,7 @@ export async function plugin (cli, client) {
       localHead.forEach(e => console.log(`\t${e}`))
     })
 
-  cli.command('bucket remote add <name> <did> <url>')
+  cli.command('bucket remote add <name> <service-did> <url>')
     .describe('Add a remote to config.')
     .action(async (name, did, url) => {
       const space = mustGetSpace(client)
@@ -239,6 +247,7 @@ export async function plugin (cli, client) {
 
   cli.command('bucket remote remove <name>')
     .describe('Remove a remote from config.')
+    .alias('bucket remote rm')
     .action(async (name) => {
       const space = mustGetSpace(client)
       const config = await readConfig(client.agent().did(), space.did())
@@ -277,11 +286,11 @@ export async function plugin (cli, client) {
         if (!config.remotes[remote]) {
           throw new Error(`remote "${remote}" is not known`)
         }
-        const connection = Remote.connect({
+        const connection = ClockRemote.connect({
           servicePrincipal: { did: () => config.remotes[remote].id },
           serviceURL: new URL(config.remotes[remote].url)
         })
-        head = await Remote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
+        head = await ClockRemote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
       } else {
         head = await readLocalClockHead(client.agent().did(), space.did())
       }
@@ -289,31 +298,45 @@ export async function plugin (cli, client) {
     })
 
   cli.command('bucket server')
-    .describe('Start a bucket HTTP server so participants can push updates directly to you.')
+    .describe('Start a bucket HTTP server so participants can push updates directly to you and pull updates directly from you.')
     .option('-p, --port', 'Port to start the server on', 9417)
     .action(async (opts) => {
       const space = mustGetSpace(client)
-      const server = Server.createServer(client.agent(), {
+      const server = ClockServer.createServer(client.agent(), {
         clock: {
-          advance: Server.provide(
+          advance: ClockServer.provide(
             ClockCaps.advance,
             async ({ capability }) => {
               if (capability.with !== space.did()) {
                 return new Failure(`invalid resource: ${capability.with}`)
               }
               const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
+              // @ts-ignore
               const res = await Clock.advance(blocks, head, capability.nb.event)
               await writeLocalClockHead(client.agent().did(), space.did(), res)
               return res
             }
           ),
-          head: Server.provide(
+          head: ClockServer.provide(
             ClockCaps.head,
             async ({ capability }) => {
               if (capability.with !== space.did()) {
                 return new Failure(`invalid resource: ${capability.with}`)
               }
               return await readLocalClockHead(client.agent().did(), space.did())
+            }
+          )
+        },
+        // @ts-ignore
+        block: {
+          get: ClockServer.provide(
+            BlockCaps.get,
+            async ({ capability }) => {
+              if (capability.with !== space.did()) {
+                return new Failure(`invalid resource: ${capability.with}`)
+              }
+              const blocks = await getBlockFetcher(client.agent().did(), space.did())
+              return await blocks.get(capability.nb.link)
             }
           )
         }
@@ -327,7 +350,7 @@ export async function plugin (cli, client) {
           }
 
           const { headers, body } = await server.request({
-            body: Buffer.from(chunks),
+            body: Buffer.concat(chunks),
             // @ts-ignore
             headers: request.headers
           })
@@ -374,8 +397,8 @@ function defaultConfig () {
   return {
     remotes: {
       origin: {
-        id: Remote.SERVICE_PRINCIPAL,
-        url: Remote.SERVICE_URL
+        id: ClockRemote.SERVICE_PRINCIPAL,
+        url: ClockRemote.SERVICE_URL
       }
     }
   }
@@ -464,6 +487,18 @@ async function writePendingBlocks (agentDID, spaceDID, blocks) {
   const dir = path.join(bucketPath(agentDID), spaceDID)
   await fs.promises.mkdir(dir, { recursive: true })
   await fs.promises.writeFile(path.join(dir, 'pending.json'), json.encode(blocks))
+}
+
+/**
+ * @param {import('@web3-storage/w3up-client').Client} client
+ * @param {import('@ucanto/interface').ConnectionView<import('./blocksvc/service').Service>} [connection]
+ */
+function getBlockServiceBlockFetcher (client, connection) {
+  const spaceDID = mustGetSpace(client).did()
+  const proofs = client.proofs([{ with: spaceDID, can: BlockCaps.get.can }])
+  if (!proofs.length) return
+  const conf = { with: spaceDID, issuer: client.agent(), proofs }
+  return new BlockServiceBlockFetcher(conf, { connection })
 }
 
 /**

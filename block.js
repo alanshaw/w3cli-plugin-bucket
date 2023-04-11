@@ -25,7 +25,7 @@ export class GatewayBlockFetcher {
       if (bytes) return { cid, bytes }
     } catch {}
     const controller = new AbortController()
-    const timeoutID = setTimeout(() => controller.abort(), 5000)
+    const timeoutID = setTimeout(() => controller.abort(), 10000)
     try {
       const res = await fetch(new URL(`/ipfs/${cid}?format=raw`, this.#url), { signal: controller.signal })
       if (!res.ok) return
