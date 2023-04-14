@@ -15,8 +15,9 @@ import * as ClockRemote from '@web3-storage/clock/client'
 import * as ClockServer from '@web3-storage/clock/server'
 import * as ClockCaps from '@web3-storage/clock/capabilities'
 import * as BlockCaps from './blocksvc/capabilities.js'
+import * as BlockClient from './blocksvc/client.js'
 import { Fetcher as BlockServiceBlockFetcher } from './blocksvc/fetcher.js'
-import { FsBlockstore, GatewayBlockFetcher } from './block.js'
+import { FsBlockstore, GatewayBlockFetcher, withCache } from './block.js'
 import { Failure } from '@ucanto/server'
 import { MultiBlockFetcher } from '@alanshaw/pail/block'
 
@@ -35,12 +36,17 @@ export async function plugin (cli, client) {
     .alias('bucket set')
     .action(async (key, value, opts) => {
       const space = mustGetSpace(client)
-      const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
+      const head = await readLocalClockHead(client.agent().did(), space.did())
       const res = await Pail.put(blocks, head, key, CID.parse(value))
 
-      await blocks.cache.put(res.event.cid, res.event.bytes)
+      await cache.put(res.event.cid, res.event.bytes)
       for (const block of res.additions) {
-        await blocks.cache.put(block.cid, block.bytes)
+        await cache.put(block.cid, block.bytes)
       }
 
       const pendingBlocks = await readPendingBlocks(client.agent().did(), space.did())
@@ -54,7 +60,11 @@ export async function plugin (cli, client) {
     .describe('Get the stored value for the given key from the bucket. If the key is not found, `undefined` is returned.')
     .action(async (key, opts) => {
       const space = mustGetSpace(client)
-      const blocks = await getBlockFetcher(client.agent().did(), space.did())
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
       const head = await readLocalClockHead(client.agent().did(), space.did())
       const value = await Pail.get(blocks, head, key)
       if (value) console.log(value.toString())
@@ -65,12 +75,17 @@ export async function plugin (cli, client) {
     .alias('bucket delete', 'bucket rm', 'bucket remove')
     .action(async (key, opts) => {
       const space = mustGetSpace(client)
-      const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
+      const head = await readLocalClockHead(client.agent().did(), space.did())
       const res = await Pail.del(blocks, head, key)
 
-      await blocks.cache.put(res.event.cid, res.event.bytes)
+      await cache.put(res.event.cid, res.event.bytes)
       for (const block of res.additions) {
-        await blocks.cache.put(block.cid, block.bytes)
+        await cache.put(block.cid, block.bytes)
       }
 
       const pendingBlocks = await readPendingBlocks(client.agent().did(), space.did())
@@ -87,7 +102,12 @@ export async function plugin (cli, client) {
     .option('--json', 'Format output as newline delimted JSON.')
     .action(async (opts) => {
       const space = mustGetSpace(client)
-      const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
+      const head = await readLocalClockHead(client.agent().did(), space.did())
       let n = 0
       if (head.length) {
         for await (const [k, v] of Pail.entries(blocks, head, { prefix: opts.prefix })) {
@@ -100,15 +120,19 @@ export async function plugin (cli, client) {
 
   cli.command('bucket tree')
     .describe('Visualise the bucket.')
-    .action(async (opts) => {
+    .action(async () => {
       const space = mustGetSpace(client)
-      const blocks = await getBlockFetcher(client.agent().did(), space.did())
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
 
       const localHead = await readLocalClockHead(client.agent().did(), space.did())
       if (!localHead.length) return
 
       const rootRes = await Pail.root(blocks, localHead)
-      rootRes.additions.forEach(a => blocks.cache.put(a.cid, a.bytes))
+      rootRes.additions.forEach(a => cache.put(a.cid, a.bytes))
 
       const shards = new ShardFetcher(blocks)
       const rshard = await shards.get(rootRes.root)
@@ -160,11 +184,15 @@ export async function plugin (cli, client) {
         return console.log('Done, nothing to push.')
       }
       
-      const blocks = await getBlockFetcher(client.agent().did(), space.did())
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
       const pendingBlocks = []
       for await (const cid of pendingCIDs) {
         // @ts-ignore
-        const bytes = await blocks.cache.get(cid)
+        const bytes = await cache.get(cid)
         pendingBlocks.push({ cid, bytes })
       }
 
@@ -213,12 +241,11 @@ export async function plugin (cli, client) {
         serviceURL: new URL(config.remotes[remote].url)
       })
       const remoteHead = await ClockRemote.head({ issuer: client.agent(), with: space.did(), proofs }, { connection })
-
-      /** @type {import('@alanshaw/pail/block').BlockFetcher} */
-      let blocks = await getBlockFetcher(client.agent().did(), space.did())
-      // @ts-ignore
-      const bsBlocks = getBlockServiceBlockFetcher(client, connection)
-      blocks = bsBlocks ? new MultiBlockFetcher(bsBlocks, blocks) : blocks
+      const cache = await getBlockCache(client.agent().did(), space.did())
+      const blocks = new MultiBlockFetcher(
+        withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+        withCache(new GatewayBlockFetcher(), cache)
+      )
 
       let localHead = await readLocalClockHead(client.agent().did(), space.did())
       let n = 1
@@ -245,9 +272,9 @@ export async function plugin (cli, client) {
       await writeConfig(client.agent().did(), space.did(), config)
     })
 
-  cli.command('bucket remote remove <name>')
+  cli.command('bucket remote rm <name>')
     .describe('Remove a remote from config.')
-    .alias('bucket remote rm')
+    .alias('bucket remote remove')
     .action(async (name) => {
       const space = mustGetSpace(client)
       const config = await readConfig(client.agent().did(), space.did())
@@ -310,7 +337,12 @@ export async function plugin (cli, client) {
               if (capability.with !== space.did()) {
                 return new Failure(`invalid resource: ${capability.with}`)
               }
-              const [blocks, head] = await Promise.all([getBlockFetcher(client.agent().did(), space.did()), readLocalClockHead(client.agent().did(), space.did())])
+              const cache = await getBlockCache(client.agent().did(), space.did())
+              const blocks = new MultiBlockFetcher(
+                withCache(await getRemoteBlockFetcher(client, space.did()), cache),
+                withCache(new GatewayBlockFetcher(), cache)
+              )
+              const head = await readLocalClockHead(client.agent().did(), space.did())
               // @ts-ignore
               const res = await Clock.advance(blocks, head, capability.nb.event)
               await writeLocalClockHead(client.agent().did(), space.did(), res)
@@ -335,8 +367,9 @@ export async function plugin (cli, client) {
               if (capability.with !== space.did()) {
                 return new Failure(`invalid resource: ${capability.with}`)
               }
-              const blocks = await getBlockFetcher(client.agent().did(), space.did())
-              return await blocks.get(capability.nb.link)
+              const cache = await getBlockCache(client.agent().did(), space.did())
+              // @ts-ignore
+              return await cache.get(capability.nb.link)
             }
           )
         }
@@ -490,6 +523,26 @@ async function writePendingBlocks (agentDID, spaceDID, blocks) {
 }
 
 /**
+ * Get a block fetcher that fetches blocks from configured remotes.
+ *
+ * @param {import('@web3-storage/w3up-client').Client} client
+ * @param {import('@ucanto/interface').DID} spaceDID
+ */
+async function getRemoteBlockFetcher (client, spaceDID) {
+  const config = await readConfig(client.agent().did(), spaceDID)
+  const fetchers = []
+  for (const remote of Object.values(config.remotes)) {
+    const fetcher = getBlockServiceBlockFetcher(client, BlockClient.connect({
+      servicePrincipal: { did: () => remote.id },
+      serviceURL: new URL(remote.url)
+    }))
+    if (!fetcher) continue
+    fetchers.push(fetcher)
+  }
+  return new MultiBlockFetcher(...fetchers)
+}
+
+/**
  * @param {import('@web3-storage/w3up-client').Client} client
  * @param {import('@ucanto/interface').ConnectionView<import('./blocksvc/service').Service>} [connection]
  */
@@ -505,12 +558,11 @@ function getBlockServiceBlockFetcher (client, connection) {
  * @param {import('@ucanto/interface').DID} agentDID
  * @param {import('@ucanto/interface').DID} spaceDID
  */
-async function getBlockFetcher (agentDID, spaceDID) {
+async function getBlockCache (agentDID, spaceDID) {
   const dir = path.join(bucketPath(agentDID), spaceDID, 'blocks')
   const cache = new FsBlockstore(dir)
   await cache.open()
-
-  return new GatewayBlockFetcher(undefined, cache)
+  return cache
 }
 
 /**
