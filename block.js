@@ -1,3 +1,5 @@
+import retry from 'p-retry'
+
 export { FsBlockstore } from 'blockstore-fs'
 
 /**
@@ -39,17 +41,19 @@ export class GatewayBlockFetcher {
    * @returns {Promise<import('@alanshaw/pail/block').AnyBlock | undefined>}
    */
   async get (cid) {
-    const controller = new AbortController()
-    const timeoutID = setTimeout(() => controller.abort(), 10000)
-    try {
-      const res = await fetch(new URL(`/ipfs/${cid}?format=raw`, this.#url), { signal: controller.signal })
-      if (!res.ok) return
-      const bytes = new Uint8Array(await res.arrayBuffer())
-      return { cid, bytes }
-    } catch (err) {
-      throw new Error(`failed to fetch block: ${cid}`, { cause: err })
-    } finally {
-      clearTimeout(timeoutID)
-    }
+    return await retry(async () => {
+      const controller = new AbortController()
+      const timeoutID = setTimeout(() => controller.abort(), 10000)
+      try {
+        const res = await fetch(new URL(`/ipfs/${cid}?format=raw`, this.#url), { signal: controller.signal })
+        if (!res.ok) return
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        return { cid, bytes }
+      } catch (err) {
+        throw new Error(`failed to fetch block: ${cid}`, { cause: err })
+      } finally {
+        clearTimeout(timeoutID)
+      }
+    })
   }
 }
